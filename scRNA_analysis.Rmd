@@ -1,0 +1,425 @@
+---
+title: "RNA_single_cell_analysis"
+author: "Giulia Fois"
+date: "14/6/2022"
+output: html_document
+---
+
+# Data preprocessing and cell quality analysis
+
+```{r, message=FALSE, warning=FALSE}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+```
+
+I modify the gene row_names by keeping just the gene symbol and removing the ensemble ID.
+
+```{r}
+retrieveGeneSymbol <- function(x) {
+  strsplit(x, "_")[[1]][1]
+}
+dataFile <- "./data/SRA667466_SRS3060029.sparse.RData"
+load(dataFile)
+
+#Change the rownames
+rownames(sm) <- lapply(rownames(sm), retrieveGeneSymbol)
+```
+
+I create the Seurat object that will contain the mouse cortex cells data
+```{r}
+#Create the Seurat object: CC cortex cells
+cc <- CreateSeuratObject(counts = sm, project = "cortex_I", min.cells = 3, min.features = 200)
+cc
+```
+Mitochondria gene names start with a lower-case character, while ribosomal ones with a capital letter
+```{r}
+#Mitochondrial/ribosomal genes start with lower case letters
+grep("^mt-",rownames(cc),value = TRUE)
+grep("^Rp[ls]",rownames(cc),value = TRUE)
+```
+
+I display the distribution for reads on mitochondrial genes, reads on ribosomal DNA, nFeatures (number of genes for which there is at least 1 count) and nCount (total number of reads)
+
+```{r, warning=FALSE}
+#Plots for %rRNA, %mtRNA, nFeature, nCount
+cc[["percent.mt"]] <- PercentageFeatureSet(cc, pattern = "^mt-")
+cc[["percent.rbp"]] <- PercentageFeatureSet(cc, pattern = "^Rp[ls]")
+names <- c("N. genes expressed", "Library size", "% reads on mt DNA", "% reads on rb DNA")
+VlnPlot(cc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt","percent.rbp"), ncol=4) & theme(axis.text.x = element_blank()) & xlab("Samples") & ylab("Value")
+VlnPlot(cc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt","percent.rbp"), ncol=4, pt.size=0) & theme(axis.text.x = element_blank()) & xlab("Samples") & ylab("Value")
+
+#Correlation among features
+FeatureScatter(cc, feature1 = "nCount_RNA", feature2 = "percent.mt") & NoLegend() & labs(title="")
+FeatureScatter(cc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") & NoLegend() & labs(title="")
+FeatureScatter(cc, feature1 = "nCount_RNA", feature2 = "percent.rbp") & NoLegend() & labs(title="")
+#Correlation is mainly between nCount and nFeatures (the greater the number of genes expressed for the sample, the greater the library size)
+```
+Let's cut away the outliers based on the nfeature_RNA and percent.mt
+```{r}
+original_samples <- length(colnames(cc))
+cc <- subset(cc, subset = nFeature_RNA < 3500 & percent.mt < 10)
+filtered_samples <- length(colnames(cc))
+data.frame(OriginalSamples=original_samples, FilteredSamples=filtered_samples, Diff=original_samples-filtered_samples)
+```
+
+Let's now normalize the data
+```{r}
+#Normalize the data
+cc <- NormalizeData(cc, normalization.method="LogNormalize", scale.factor=10000)
+#Counts are in cc@assays$RNA@counts
+#Normalized counts are in cc@assays$RNA@data
+```
+
+Let's compute cell cycle scores
+```{r, warning=FALSE}
+#Based on cell cycle-specific genes, assign putative cycle to each cell
+cc <- CellCycleScoring(cc, s.features = cc.genes.updated.2019$s.genes, g2m.features = cc.genes.updated.2019$g2m.genes, set.ident = TRUE)
+```
+
+```{r}
+#Select the 2000 genes with highest variance
+cc <- FindVariableFeatures(cc, selection.method="vst", nfeatures = 2000)
+#Plot the 10 most variable genes
+top10 <- head(VariableFeatures(cc), 10)
+LabelPoints(plot=VariableFeaturePlot(cc), points=top10, repel=TRUE)
+```
+Let's scale data in order to have, across cells, mean 0 and variance 1. I keep the original structure in order to be able to work on it later if I want to remove cell cycle/mitochondrial RNA/do other analyses
+```{r}
+cc_original <- cc
+#Shift expression of the gene to have, across cells, mean 0 and variance 1 
+cc <- ScaleData(cc, features=rownames(cc))
+#results are in #cc[["RNA"]]@scale.data
+```
+
+# PCA and Clustering
+
+I perform dimensional reduction with PCA, and visualize the most variable genes for the first 5 PCs
+```{r, fig.height=3.5, fig.width=10, fig.height=6}
+cc <- RunPCA(cc, features=VariableFeatures(object=cc))
+print(cc[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(cc, dims = 1:2, reduction = "pca")
+VizDimLoadings(cc, dims = 3:4, reduction = "pca")
+VizDimLoadings(cc, dims = 4:5, reduction = "pca")
+```
+
+Let's plot cells according to the first two principal components, and check whether they are clustered by cell cycle to assess if we want to keep it for downstream analyses or not.
+```{r}
+DimPlot(cc, reduction="pca") & labs(color = "Cell cycle")
+```
+
+I compute the elbow plot to find a tentative number of principal components to later perform clustering on
+```{r}
+ElbowPlot(cc, ndims=30) & xlab("Principal components")
+```
+
+This is almost equal to the one that is obtained by employing the technique that finds the number of PCs explaining 75% of the variance
+```{r}
+alt_pc <- (cc$pca@stdev)^2
+alt_pc <- alt_pc/sum(alt_pc)
+alt_pc <- cumsum(alt_pc)[1:50] 
+alt_pc <- min(which(alt_pc>=0.75))
+alt_pc
+```
+
+Since we see that the standard deviation starts going down after 10 PCs, I decided to try clustering with 10 PCs as well.
+We try the downstream analyses with two different values: 14 coming from the elbow plot and supported by the fact that they explain 75% of the variance, and 10 because the plot has already gone down before reaching 10 PCs.
+
+```{r}
+#Build the nearest neighbours graph
+cc_10 <- FindNeighbors(cc, dims = 1:10)
+cc_14 <- FindNeighbors(cc, dims= 1:14)
+```
+
+For both PC values, I try to perform clustering with 2 different resolution values. Considering the fact that having a higher number of principal components means having a slight better granularity on variability, I expect to find less and smaller clusters with 14 PCs than 10 PCs. For this reason, I employ a slightly lower resolution for clustering with 14 PCs.
+
+```{r}
+#Find the clusters
+cc_10_05 <- FindClusters(cc_10, resolution=0.5)
+cc_10_07 <- FindClusters(cc_10, resolution=0.7)
+cc_14_04 <- FindClusters(cc_14, resolution=0.4)
+cc_14_06 <- FindClusters(cc_14, resolution=0.6)
+```
+
+Let's plot the clusters we obtained by using the tSNE and UMAP visualization techniques.
+
+```{r}
+#tSNE
+cc_10_05 <- RunTSNE(cc_10_05, dims=1:10)
+cc_10_07 <- RunTSNE(cc_10_07, dims=1:10)
+
+DimPlot(cc_10_05, reduction="tsne") & labs(color = "Cluster") & ggtitle("TSNE (10 PCs, 0.5 resolution)")
+DimPlot(cc_10_07, reduction="tsne") & labs(color = "Cluster") & ggtitle("TSNE (10 PCs, 0.7 resolution)")
+
+
+cc_14_04 <- RunTSNE(cc_14_04, dims=1:14)
+cc_14_06 <- RunTSNE(cc_14_06, dims=1:14)
+
+DimPlot(cc_14_04, reduction="tsne") & labs(color = "Cluster") & ggtitle("TSNE (14 PCs, 0.4 resolution)")
+DimPlot(cc_14_06, reduction="tsne") & labs(color = "Cluster") & ggtitle("TSNE (14 PCs, 0.6 resolution)")
+```
+
+```{r}
+#UMAP
+cc_10_05 <- RunUMAP(cc_10_05, dims=1:10)
+cc_10_07 <- RunUMAP(cc_10_07, dims=1:10)
+
+DimPlot(cc_10_05, reduction="umap") & labs(color = "Cluster") & ggtitle("UMAP (10 PCs, 0.5 resolution)")
+DimPlot(cc_10_07, reduction="umap") & labs(color = "Cluster") & ggtitle("UMAP (10 PCs, 0.7 resolution)")
+
+
+cc_14_04 <- RunUMAP(cc_14_04, dims=1:14)
+cc_14_06 <- RunUMAP(cc_14_06, dims=1:14)
+
+DimPlot(cc_14_04, reduction="umap") & labs(color = "Cluster") & ggtitle("UMAP (14 PCs, 0.4 resolution)")
+DimPlot(cc_14_06, reduction="umap") & labs(color = "Cluster") & ggtitle("UMAP (14 PCs, 0.6 resolution)")
+```
+
+We notice that clustering with 10 PCs and 0.5/0.7 resolution doesn't practically make any difference. Furthermore, samples coming from clusters 6 and 12 seem to be overlapping. Clustering with 14 PCs seems to give better results. I prefer the version with 0.4 resolution because the one with 0.6 resolution, in my opinion, creates 2 additional clusters that don't look very meaningful.
+Let's select this clustering result as the one to employ in downstream analyses. Moreover, we count the number of cells in each cluster and label clusters in the plots with their corresponding number for better visualization both for our chosen clustering and for one with 10 PCs. 
+
+```{r}
+chosen_cc <- cc_14_04
+ncells <- integer(14)
+for(i in 1:14) {
+  ncells[i] <- sum((cc_14_04@meta.data$"RNA_snn_res.0.4") == (i-1))
+}
+ncells_df <- data.frame("N_cells"=ncells)
+rownames(ncells_df) <- as.character(c(0:13))
+ncells_df
+```
+
+
+```{r}
+ncells <- integer(14)
+for(i in 1:14) {
+  ncells[i] <- sum((cc_10_07@meta.data$"RNA_snn_res.0.7") == (i-1))
+}
+ncells_df <- data.frame("N_cells"=ncells)
+rownames(ncells_df) <- as.character(c(0:13))
+ncells_df
+```
+
+```{r}
+Idents(object = cc_10_07) <- "RNA_snn_res.0.7"
+DimPlot(cc_10_07,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 4) & labs(color = "Cluster") & ggtitle("UMAP (10 PCs, 0.7 resolution)")
+Idents(object = cc_14_04) <- "RNA_snn_res.0.4"
+DimPlot(cc_14_04,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 4) & labs(color = "Cluster") & ggtitle("UMAP (14 PCs, 0.4 resolution)")
+```
+
+Let's check if some parameters (such as number of reads/number of transcribed genes, % reads coming from mitochondrial DNA, % reads mapped on ribosomal RNA, or cell cycle) influenced the clustering, or if clusters were due to actual variaiblity in gene expression (as we wish to obtain).
+
+```{r}
+VlnPlot(chosen_cc, features="nCount_RNA") & labs(x="Cluster", y="Number of reads")
+VlnPlot(chosen_cc, features="nFeature_RNA")  & labs(x="Cluster", y="N. of transcribed genes")
+VlnPlot(chosen_cc, features="percent.mt") & labs(x="Cluster", y="% reads coming from mtDNA")
+VlnPlot(chosen_cc, features="percent.rbp") & labs(x="Cluster", y="% reads coming from rbRNA")
+
+chosen_cc@meta.data %>%
+  group_by(seurat_clusters,Phase) %>%
+  count() %>%
+  group_by(seurat_clusters) %>%
+  mutate(percent=100*n/sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x=seurat_clusters,y=percent, fill=Phase)) +
+  geom_col() +
+  ggtitle("Percentage of cell cycle phases per cluster") + 
+  xlab("Cluster")
+```
+
+Cell cycle don't seem to influence clustering. However, clusters 2, 3 and 13 seem to contain more cells with a higher percentage of reads mapped on rbRNA. Moreover, I noticed that cluster 5, 11 and 12 may be biased towards cells having higher % of reads coming from mitochondria DNA. For this reason, I tried to replicate the analysis by using the original cc object and scaling it regressing by percent.mt. We can see how this alone results in having 13 clusters instead of the original 14: we see that cluster 11 got cut out, and we can conclude that indeed it was artificially due to the variance in mitochondrial RNA percentage.
+Clusters 5 and 12, instead, remained pretty much the same: their cells were grouped together according to another factor, hopefully biological. 
+I proceed with the downstream analysis with this new clustering.
+
+```{r}
+cc_no_mit <- ScaleData(cc_original, vars.to.regress = "percent.mt", features=rownames(cc_original))
+cc_no_mit <- RunPCA(cc_no_mit, features=VariableFeatures(object=cc_no_mit))
+cc_14_no_mit <- FindNeighbors(cc_no_mit, dims= 1:14)
+cc_14_04_no_mit <- FindClusters(cc_14_no_mit, resolution=0.4)
+
+cc_14_04_no_mit <- RunUMAP(cc_14_04_no_mit, dims=1:14)
+
+Idents(object = cc_14_04_no_mit) <- "RNA_snn_res.0.4"
+DimPlot(cc_14_04_no_mit,
+        reduction = "umap",
+        label = TRUE,
+        label.size = 4) & labs(color = "Cluster") & ggtitle("UMAP (14 PCs, 0.4 resolution, %mt regressed out)")
+VlnPlot(cc_14_04_no_mit, features="percent.mt") & labs(x="Cluster", y="% reads coming from mtDNA")
+VlnPlot(cc_14_04_no_mit, features="percent.rbp") & labs(x="Cluster", y="% reads coming from mtDNA")
+VlnPlot(cc_14_04_no_mit, features="nCount_RNA") & labs(x="Cluster", y="Number of reads")
+VlnPlot(cc_14_04_no_mit, features="nFeature_RNA")  & labs(x="Cluster", y="N. of transcribed genes")
+
+cc_14_04_no_mit@meta.data %>%
+  group_by(seurat_clusters,Phase) %>%
+  count() %>%
+  group_by(seurat_clusters) %>%
+  mutate(percent=100*n/sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x=seurat_clusters,y=percent, fill=Phase)) +
+  geom_col() +
+  ggtitle("Percentage of cell cycle phases per cluster") + 
+  xlab("Cluster")
+```
+
+```{r}
+ncells <- integer(13)
+for(i in 1:13) {
+  ncells[i] <- sum((cc_14_04_no_mit@meta.data$"RNA_snn_res.0.4") == (i-1))
+}
+ncells_df <- data.frame("N_cells"=ncells)
+rownames(ncells_df) <- as.character(c(0:12))
+ncells_df
+```
+
+
+```{r}
+chosen_cc <- cc_14_04_no_mit
+```
+
+
+# Finding marker genes
+
+I now proceed with the analysis by starting to look for possible marker genes.
+```{r}
+chosen_cc.markers <- FindAllMarkers(chosen_cc, only.pos=TRUE, min.pct=0.25, logfc.threshold = 0.25)
+marker_cluster_groups <- chosen_cc.markers %>%
+    group_by(cluster) %>%
+    slice_max(n = 10, order_by = avg_log2FC)
+
+marker_cluster_groups
+```
+
+
+We compute a heatmap to assess whether there is overlap among candidate marker genes of different clusters.
+
+```{r fig.width=20}
+chosen_cc.markers %>%
+    group_by(cluster) %>%
+    top_n(n = 5, wt = avg_log2FC) -> top_genes
+DoHeatmap(chosen_cc, features=top_genes$gene) + NoLegend() + theme(text=element_text(size=10))
+```
+By analyzing this heatmap, we can find quite a few possible overlaps, especially in the center of the matrix, among clusters 4, 5, 6, 7 and 8 (that are also close in the plot).
+To see if these clusters may indeed represent different cell types or be rather merged into a bigger cluster, I compute two kinds of comparisons:
+- Cluster 4,5,6,7,8 vs all
+- Each cluster against the others into this subset (e.g. 4 vs 5,6,7,8 - 5 vs 4,6,7,8 and so on)
+
+## Cluster 4, 5, 6, 7, 8 vs all
+```{r}
+cluster45678vsAll.markers <- FindMarkers(chosen_cc, ident.1 = c(4,5,6,7,8), min.pct = 0.25, test.use = "wilcox")
+cluster45678vsAll.markers <- cluster45678vsAll.markers[order(-cluster45678vsAll.markers$avg_log2FC),]
+head(cluster45678vsAll.markers, n = 10)
+```
+
+The top 5 genes obtained by comparing these clusters against all the others are Slc17a7, Meg3, Grin2b, Olfm1, Atp2b2. Let's see if we could identify some neuron subtypes
+
+### Cluster 4 vs 5,6,7,8
+
+```{r}
+cluster4vs5678.markers <- FindMarkers(chosen_cc, ident.1 = 4, ident.2 = c(5,6,7,8), min.pct = 0.25, test.use = "wilcox")
+cluster4vs5678.markers <- cluster4vs5678.markers[order(-cluster4vs5678.markers$avg_log2FC),]
+head(cluster4vs5678.markers, n = 10)
+```
+
+### Cluster 5 vs 6,7,8,9
+
+```{r}
+cluster5vs4678.markers <- FindMarkers(chosen_cc, ident.1 = 5, ident.2 = c(4,6,7,8), min.pct = 0.25, test.use = "wilcox")
+cluster5vs4678.markers <- cluster5vs4678.markers[order(-cluster5vs4678.markers$avg_log2FC),]
+head(cluster5vs4678.markers, n = 10)
+```
+
+We don't find particular differences in expression between cluster 5 and the others.
+
+### Cluster 6 vs 4,5,7,8
+
+```{r}
+cluster6vs4578.markers <- FindMarkers(chosen_cc, ident.1 = 6, ident.2 = c(4,5,7,8), min.pct = 0.25, test.use = "wilcox")
+cluster6vs4578.markers <- cluster6vs4578.markers[order(-cluster6vs4578.markers$avg_log2FC),]
+head(cluster6vs4578.markers, n = 10)
+```
+
+### Cluster 7 vs 4,5,6,8
+
+```{r}
+cluster7vs4568.markers <- FindMarkers(chosen_cc, ident.1 = 7, ident.2 = c(4,5,6,8), min.pct = 0.25, test.use = "wilcox")
+cluster7vs4568.markers <- cluster7vs4568.markers[order(-cluster7vs4568.markers$avg_log2FC),]
+head(cluster7vs4568.markers, n = 10)
+```
+
+### Cluster 8 vs 4,5,6,7
+
+```{r}
+cluster8vs4567.markers <- FindMarkers(chosen_cc, ident.1 = 8, ident.2 = c(4,5,6,7), min.pct = 0.25, test.use = "wilcox")
+cluster8vs4567.markers <- cluster8vs4567.markers[order(-cluster8vs4567.markers$avg_log2FC),]
+head(cluster8vs4567.markers, n = 10)
+```
+
+Finally, let's assign our chosen putative markers to all the clusters.
+
+```{r}
+marker_0 <- marker_cluster_groups[(marker_cluster_groups$gene == "Gas7" & marker_cluster_groups$cluster == 0), c("avg_log2FC", "pct.1", "pct.2", "p_val_adj", "cluster", "gene")]
+marker_1 <- marker_cluster_groups[(marker_cluster_groups$gene == "Aldoc" & marker_cluster_groups$cluster == 1), c("avg_log2FC", "pct.1", "pct.2", "p_val_adj", "cluster", "gene")]
+marker_2 <- marker_cluster_groups[(marker_cluster_groups$gene == "Cldn5" & marker_cluster_groups$cluster == 2), c("avg_log2FC", "pct.1", "pct.2", "p_val_adj", "cluster", "gene")]
+marker_3 <- marker_cluster_groups[(marker_cluster_groups$gene == "hexb" & marker_cluster_groups$cluster == 3), c("avg_log2FC", "pct.1", "pct.2", "p_val_adj", "cluster", "gene")]
+
+marker_4 <- cluster4vs5678.markers[rownames(cluster4vs5678.markers) == "Rorb", c("avg_log2FC", "pct.1", "pct.2", "p_val_adj")]
+marker_4$gene <- "Rorb"
+marker_4$cluster <- as.factor(4)
+
+marker_5 <- marker_cluster_groups[(marker_cluster_groups$gene == "Atp1a1" & marker_cluster_groups$cluster == 5), c("avg_log2FC", "pct.1", "pct.2", "p_val_adj", "cluster", "gene")]
+
+marker_6 <- cluster6vs4578.markers[rownames(cluster6vs4578.markers) == "Calb1", c("avg_log2FC", "pct.1", "pct.2", "p_val_adj")]
+marker_6$gene <- "Calb1"
+marker_6$cluster <- as.factor(6)
+
+marker_7 <- cluster7vs4568.markers[rownames(cluster7vs4568.markers) == "Hs3st2", c("avg_log2FC", "pct.1", "pct.2", "p_val_adj")]
+marker_7$gene <- "Hs3st2"
+marker_7$cluster <- as.factor(7)
+
+marker_8 <- cluster8vs4567.markers[rownames(cluster8vs4567.markers) == "Rprm", c("avg_log2FC", "pct.1", "pct.2", "p_val_adj")]
+marker_8$gene <- "Rprm"
+marker_8$cluster <- as.factor(8)
+
+marker_9 <- marker_cluster_groups[(marker_cluster_groups$gene == "Mobp" & marker_cluster_groups$cluster == 9), c("avg_log2FC", "pct.1", "pct.2", "p_val_adj", "cluster", "gene")]
+marker_10 <- marker_cluster_groups[(marker_cluster_groups$gene == "Pdgfra" & marker_cluster_groups$cluster == 10), c("avg_log2FC", "pct.1", "pct.2", "p_val_adj", "cluster", "gene")]
+marker_11 <- marker_cluster_groups[(marker_cluster_groups$gene == "Vip" & marker_cluster_groups$cluster == 11), c("avg_log2FC", "pct.1", "pct.2", "p_val_adj", "cluster", "gene")]
+marker_12 <- marker_cluster_groups[(marker_cluster_groups$gene == "Apoe" & marker_cluster_groups$cluster == 12), c("avg_log2FC", "pct.1", "pct.2", "p_val_adj", "cluster", "gene")]
+```
+
+
+Let's build a table with our marker genes
+```{r}
+candidate_markers <- bind_rows(list(marker_0, marker_1, marker_2, marker_3, marker_4,
+                                  marker_5, marker_6, marker_7, marker_8, marker_9, marker_10,
+                                  marker_11, marker_12))
+print(candidate_markers)
+```
+
+Let's see how our marker genes are express throughout the clusters
+```{r, fig.width=10}
+VlnPlot(chosen_cc, features = c("Gas7", "Aldoc")) & xlab("Cluster")
+VlnPlot(chosen_cc, features = c("Cldn5", "hexb")) & xlab("Cluster")
+VlnPlot(chosen_cc, features = c("Rorb", "Atp1a1")) & xlab("Cluster")
+VlnPlot(chosen_cc, features = c("Calb1", "Hs3st2")) & xlab("Cluster")
+VlnPlot(chosen_cc, features = c("Rprm", "Mobp")) & xlab("Cluster")
+VlnPlot(chosen_cc, features = c("Pdgfra", "Vip")) & xlab("Cluster")
+VlnPlot(chosen_cc, features ="Lyz2") & xlab("Cluster")
+DotPlot(chosen_cc, features = c("Gas7", "Aldoc", "Cldn5", "hexb", "Rorb", "Atp1a1", "Calb1","Hs3st2","Rprm", "Mobp", "Pdgfra", "Vip", "Lyz2")) & xlab("Genes") & ylab("Cluster")
+```
+
+Let's finally plot our cell types onto the clustering
+```{r, fig.width=12}
+cluster_figure <- chosen_cc
+new.cluster.ids <- c("Neuron", "Purkinje", "Endothelial", "Microglia", "Sensory Neuron", "Neuron", "Sensory Neuron", "Excitatory Neuron", "Excitatory Neuron", "Oligodendrocyte", "Olig. Precursor", "Interneuron", "Astrocyte")
+names(new.cluster.ids) <- levels(cluster_figure)
+cluster_figure <- RenameIdents(cluster_figure, new.cluster.ids)
+DimPlot(cluster_figure, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+```
+
